@@ -25,6 +25,19 @@ import socket
 import sys
 import threading
 
+try:
+    import readline as _readline
+    _readline.parse_and_bind(r'"\e[A": previous-history')   # Up    → older msg
+    _readline.parse_and_bind(r'"\e[B": next-history')       # Down  → newer msg
+    _readline.parse_and_bind(r'"\e[C": forward-char')       # Right → cursor →
+    _readline.parse_and_bind(r'"\e[D": backward-char')      # Left  → cursor ←
+    _readline.parse_and_bind(r'"\e[5~": previous-history')  # PgUp  → older msg
+    _readline.parse_and_bind(r'"\e[6~": next-history')      # PgDn  → newer msg
+    _readline.parse_and_bind(r'"\e[H": beginning-of-line')  # Home
+    _readline.parse_and_bind(r'"\e[F": end-of-line')        # End
+except ImportError:
+    _readline = None
+
 import crypto as _crypto
 from logger   import get_logger
 from protocol import (
@@ -111,36 +124,61 @@ def _receiver(
     stop_event: threading.Event,
     prompt_ref: list,
     key_ref: list,         # key_ref[0]: bytes | None — encryption key
+    pending_ack: dict,     # shared with main thread for send-echo tracking
 ) -> None:
     """
     Background thread: reads messages from the server and prints them.
     Decrypts using key_ref[0] if set.  Never auto-accepts a server-sent key
     — the user must have supplied the password before connecting.
     """
+
+    def _out(line: str) -> None:
+        buf = _readline.get_line_buffer() if _readline else ""
+        sys.stdout.write("\r\033[K" + line + "\n")
+        sys.stdout.write(prompt_ref[0] + buf)
+        sys.stdout.flush()
+
+    def _finish_pending(tick: str) -> None:
+        t = pending_ack.get("timer")
+        if t:
+            t.cancel()
+        pending_ack["active"] = False
+        pending_ack["timer"] = None
+        line = pending_ack.get("line", "")
+        buf = _readline.get_line_buffer() if _readline else ""
+        sys.stdout.write("\r\033[K" + tick + " " + line + "\n")
+        sys.stdout.write(prompt_ref[0] + buf)
+        sys.stdout.flush()
+
     while not stop_event.is_set():
         try:
             msg = recv_message(sock)
         except (ConnectionError, NXPProtocolError, OSError):
             if not stop_event.is_set():
-                _clear_line()
-                print("\n[disconnected from server]")
+                if pending_ack.get("active"):
+                    _finish_pending("\033[31m✗\033[0m")
+                sys.stdout.write("\r\033[K\n[disconnected from server]\n")
+                sys.stdout.flush()
                 stop_event.set()
             break
 
-        _clear_line()
-
         if msg.command == "ACK":
-            print(f"  \033[32m[server]{_RESET} {msg.payload}")
+            if msg.payload in ("Message delivered", "OK"):
+                if pending_ack.get("active"):
+                    _finish_pending("\033[32m✓\033[0m")
+            else:
+                _out(f"  \033[32m[server]{_RESET} {msg.payload}")
         elif msg.command == "ERROR":
-            print(f"  \033[31m[error ]{_RESET} {msg.payload}")
+            if pending_ack.get("active"):
+                # FIX 3: mark the pending send as failed before showing error
+                _finish_pending("\033[31m✗\033[0m")
             # Server sends ERROR then closes — stop_event will be set by the
             # next recv_message call when it gets ConnectionError.
+            _out(f"  \033[31m[error ]{_RESET} {msg.payload}")
         elif msg.command == "SEND":
-            print(_format_chat(msg.payload, key_ref[0]))
+            _out(_format_chat(msg.payload, key_ref[0]))
         else:
-            print(f"  [{msg.command}] {msg.payload}")
-
-        _reprint_prompt(prompt_ref[0])
+            _out(f"  [{msg.command}] {msg.payload}")
 
 
 # ── Main client logic ─────────────────────────────────────────────────────────
@@ -228,13 +266,14 @@ def run_client(host: str = HOST, port: int = PORT,
 
     print("Type /help for commands.\n")
 
-    key_ref    = [enc_key]
-    prompt_ref = ["> "]
-    stop_event = threading.Event()
+    key_ref     = [enc_key]
+    prompt_ref  = ["> "]
+    stop_event  = threading.Event()
+    pending_ack: dict = {"active": False, "timer": None}
 
     receiver_thread = threading.Thread(
         target=_receiver,
-        args=(sock, stop_event, prompt_ref, key_ref),
+        args=(sock, stop_event, prompt_ref, key_ref, pending_ack),
         daemon=True,
     )
     receiver_thread.start()
@@ -283,7 +322,7 @@ def run_client(host: str = HOST, port: int = PORT,
                 if len(parts) < 2 or not parts[1].strip():
                     print("  Usage: /send <message>")
                     continue
-                _do_send(sock, parts[1], key_ref)
+                _do_send(sock, parts[1], key_ref, pending_ack, prompt_ref)
 
             elif line in ("/leave", "/quit", "/exit"):
                 sock.sendall(build_message(CMD_LEAVE, ""))
@@ -294,12 +333,15 @@ def run_client(host: str = HOST, port: int = PORT,
 
             else:
                 if joined:
-                    _do_send(sock, line, key_ref)
+                    _do_send(sock, line, key_ref, pending_ack, prompt_ref)
                 else:
                     print("  Unknown command. Type /help for usage.")
 
     finally:
         stop_event.set()
+        t = pending_ack.get("timer")
+        if t:
+            t.cancel()
         try:
             sock.close()
         except OSError:
@@ -308,10 +350,41 @@ def run_client(host: str = HOST, port: int = PORT,
         print("\nDisconnected.")
 
 
-def _do_send(sock: socket.socket, text: str, key_ref: list) -> None:
-    """Encrypt with current key (if set), then send NXP SEND."""
+def _do_send(sock: socket.socket, text: str, key_ref: list,
+             pending_ack: dict, prompt_ref: list) -> None:
+    """Echo own message optimistically, then encrypt and send NXP SEND."""
     key     = key_ref[0]
     payload = _crypto.encrypt(key, text) if key else text
+
+    own_line = f"{_BOLD}[you]{_RESET} {text}"
+    pending_ack["line"] = own_line
+    sys.stdout.write("\033[1A\033[2K" + own_line)
+    sys.stdout.flush()
+
+    if _readline:
+        _readline.add_history(text)
+
+    # Cancel any leftover timer from a previous send that never got an ACK.
+    existing = pending_ack.get("timer")
+    if existing:
+        existing.cancel()
+
+    # 3-second timeout: if the receiver never sees an ACK/ERROR, mark failed.
+    def _timeout() -> None:
+        if pending_ack.get("active"):
+            pending_ack["active"] = False
+            pending_ack["timer"] = None
+            line = pending_ack.get("line", "")
+            buf = _readline.get_line_buffer() if _readline else ""
+            sys.stdout.write("\r\033[K\033[31m✗\033[0m " + line + " \033[31mtimeout\033[0m\n")
+            sys.stdout.write(prompt_ref[0] + buf)
+            sys.stdout.flush()
+
+    timer = threading.Timer(3.0, _timeout)
+    pending_ack["active"] = True
+    pending_ack["timer"]  = timer
+    timer.start()
+
     sock.sendall(build_message(CMD_SEND, payload))
 
 
